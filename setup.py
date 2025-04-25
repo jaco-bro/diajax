@@ -1,0 +1,35 @@
+from setuptools import find_packages, setup
+
+requirements = [
+    "jax-metal==0.1.1; platform_system=='Darwin'",
+    "jaxlib==0.5.0",
+    "jax==0.5.0",
+    "flax==0.10.4",
+    "safetensors >= 0.5.3",
+    "pydantic>=2.11.3",
+    "huggingface-hub>=0.30.2",
+    "soundfile>=0.13.1",
+    "descript-audio-codec>=1.0.0",
+]
+
+setup(
+    name='diajax',
+    url='https://github.com/jaco-bro/diajax',
+    py_modules=['dia'],
+    packages=find_packages(),
+    version='0.0.1a0',
+    readme="README.md",
+    author_email="backupjjoe@gmail.com",
+    description="Dia-JAX: A JAX port of Dia, the text-to-speech model for generating realistic dialogue from text with emotion and tone control.",
+    long_description=open("README.md", encoding="utf-8").read(),
+    long_description_content_type="text/markdown",
+    author="J Joe",
+    license="Apache-2.0",
+    python_requires=">=3.12.8",
+    install_requires=requirements,
+    entry_points={
+        "console_scripts": [
+            "dia=dia:main",
+        ],
+    },
+)
