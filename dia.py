@@ -308,7 +308,7 @@ class Decoder(nnx.Module):
             channel_tokens = tgt_ids_Bx1xC[..., i]
             channel_embed = self.embeddings[i](channel_tokens)
             x = channel_embed if x is None else x + channel_embed
-        new_self_kv_caches = []
+        new_self_kv_caches = [] # [] vmap
         for i, layer in enumerate(self.layers):
             x, new_kv = layer(x, self_attn_mask=None, cross_attn_mask=cross_attn_mask, self_rope_cos=self_rope_cos, self_rope_sin=self_rope_sin, cross_rope_cos=cross_rope_cos, cross_rope_sin=cross_rope_sin, self_attn_cache=self_kv_caches[i], cross_attn_cache=cross_kv_caches[i])
             new_self_kv_caches.append(new_kv)
@@ -338,44 +338,24 @@ class DiaModel(nnx.Module):
         self.encoder = Encoder(config, rngs=rngs)
         self.decoder = Decoder(config, rngs=rngs)
 
-def sample_next_token(
-    logits_BCxV: jnp.ndarray,
-    temperature: float,
-    top_p: float,
-    use_cfg_filter: bool,
-    cfg_filter_top_k: int | None = None,
-    rng_key = None,
-) -> jnp.ndarray:
-    if temperature == 0.0:
-        return jnp.argmax(logits_BCxV, axis=-1)
-    logits = logits_BCxV / temperature
-    if use_cfg_filter and cfg_filter_top_k is not None:
-        _, top_k_indices = jax.lax.top_k(logits, k=cfg_filter_top_k)
-        batch_size, vocab_size = logits.shape
-        mask = jnp.ones((batch_size, vocab_size), dtype=bool)
-        batch_indices = jnp.arange(batch_size)[:, None]
-        batch_indices = jnp.repeat(batch_indices, cfg_filter_top_k, axis=1)
-        mask = mask.at[batch_indices, top_k_indices].set(False)
-        logits = jnp.where(mask, -jnp.inf, logits)
-    if top_p < 1.0:
-        probs = jax.nn.softmax(logits, axis=-1)
-        sorted_indices = jnp.argsort(-probs, axis=-1)
-        sorted_probs = jnp.take_along_axis(probs, sorted_indices, axis=-1)
-        cumulative_probs = jnp.cumsum(sorted_probs, axis=-1)
-        sorted_mask = cumulative_probs > top_p
-        shifted_mask = jnp.zeros_like(sorted_mask)
-        shifted_mask = shifted_mask.at[:, 1:].set(sorted_mask[:, :-1])
-        mask = jnp.zeros_like(probs, dtype=bool)
-        batch_size, vocab_size = probs.shape
-        batch_indices = jnp.arange(batch_size)[:, None]
-        batch_indices = jnp.repeat(batch_indices, vocab_size, axis=1)
-        mask = mask.at[batch_indices, sorted_indices].set(shifted_mask)
-        logits = jnp.where(mask, -jnp.inf, logits)
-    if rng_key is None:
-        rng_key = jax.random.PRNGKey(0)
-    return jax.random.categorical(rng_key, logits)
+@nnx.jit
+def sample_next_token(logits, top_p, cfg_filter_top_k, rng_key):
+    sorted_indices = jnp.argsort(-logits, axis=-1)
+    sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
+    batch_size, vocab_size = logits.shape
+    top_k_mask = jnp.arange(vocab_size) < cfg_filter_top_k
+    top_k_mask = jnp.broadcast_to(top_k_mask, (batch_size, vocab_size))
+    filtered_logits = jnp.where(top_k_mask, sorted_logits, -1e9)
+    probs = jax.nn.softmax(filtered_logits, axis=-1)
+    cumulative_probs = jnp.cumsum(probs, axis=-1)
+    top_p_mask = cumulative_probs <= top_p
+    top_p_mask = top_p_mask | (jnp.arange(vocab_size) == 0).reshape(1, -1)
+    final_logits = jnp.where(top_p_mask, filtered_logits, -1e9)
+    final_logits_original = jnp.zeros_like(logits) - 1e9
+    final_logits_original = final_logits_original.at[jnp.arange(batch_size)[:, None], sorted_indices].set(final_logits)
+    return jax.random.categorical(rng_key, final_logits_original)
 
-def generate(model, config, text, max_tokens=None, cfg_scale=3.0, temperature=0.0, top_p=0.95, use_cfg_filter=True, cfg_filter_top_k=35, seed=0):
+def generate(model, config, text, max_tokens=None, cfg_scale=3.0, temperature=1.3, top_p=0.95, use_cfg_filter=True, cfg_filter_top_k=35, seed=0):
     key = jax.random.PRNGKey(seed)
     num_channels = config.data.channels
     audio_bos_value = config.data.audio_bos_value
@@ -434,9 +414,9 @@ def generate(model, config, text, max_tokens=None, cfg_scale=3.0, temperature=0.
         cond_logits_CxV = logits_last_BxCxV[1]  
         cfg_logits_CxV = cond_logits_CxV + cfg_scale * (cond_logits_CxV - uncond_logits_CxV)
         logits_CxV = cfg_logits_CxV.reshape((-1, V))
-        logits_CxV = logits_CxV.at[:, 1025:].set(-jnp.inf)  
-        pred_C = sample_next_token(logits_CxV, temperature=temperature, top_p=top_p, use_cfg_filter=use_cfg_filter, cfg_filter_top_k=cfg_filter_top_k, rng_key=key) # pred_C = jnp.argmax(logits_CxV, axis=-1)
-        print(f'{pred_C=}')
+        logits_CxV = logits_CxV.at[:, 1025:].set(-1e9)  
+        pred_C = sample_next_token(logits_CxV/temperature, top_p=top_p, cfg_filter_top_k=cfg_filter_top_k, rng_key=key) if temperature > 0 else jnp.argmax(logits_CxV, axis=-1)
+        # print(f'{pred_C=}')
         generation_step_index = step
         delay_mask = generation_step_index >= delay_tensor
         pred_C = jnp.where(delay_mask, pred_C, audio_bos_value)
@@ -468,18 +448,12 @@ def load(model_name = 'jaco-bro/Dia-1.6B'):
         state_dict[tuple(int(part) if part.isdigit() else part for part in path.split('.'))].value = jnp.array(val, dtype=jnp.bfloat16)
     return nnx.merge(graphdef, nnx.State.from_flat_path(state_dict)), config
 
-# def main(text = "[S1] Dia is an open weights text to dialogue model. [S2] You get full control over scripts and voices. [S1] Wow. Amazing. (laughs) [S2] Try it now on Git hub or Hugging Face."):
-#     model, config = load('jaco-bro/Dia-1.6B')
-#     output = generate(model, config, text)
-#     import soundfile as sf
-#     sf.write('output.mp3', output, 44100)
-
 def main():
     import argparse
     import soundfile as sf
     parser = argparse.ArgumentParser(description='Dia-JAX: Generate dialogue audio from text')
-    parser.add_argument('--text', type=str, default="[S1] Dia is an open weights text to dialogue model. [S2] You get full control over scripts and voices. [S1] Wow. Amazing. (laughs) [S2] Try it now on Git hub or Hugging Face.",
-                        help='Input text with [S1] and [S2] speaker tags')
+    parser.add_argument('--text', type=str, default="[S1] Dear Jacks, to generate audio from text from any machine. (applause) [S2] Really? How! (screams) [S1] With flakes and an axe. (chuckles)",
+                        help='Input text with [S1] and [S2] speaker tags'),
     parser.add_argument('--output', type=str, default='output.mp3',
                         help='Output audio filename')
     parser.add_argument('--model', type=str, default='jaco-bro/Dia-1.6B',
@@ -488,7 +462,7 @@ def main():
                         help='Maximum number of tokens to generate')
     parser.add_argument('--cfg-scale', type=float, default=3.0,
                         help='CFG scale for generation')
-    parser.add_argument('--temperature', type=float, default=0.0,
+    parser.add_argument('--temperature', type=float, default=0.7,
                         help='Temperature for sampling')
     parser.add_argument('--top-p', type=float, default=0.95,
                         help='Top-p sampling parameter')

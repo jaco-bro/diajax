@@ -30,19 +30,16 @@ pip install diajax
 
 ```bash
 # Generate audio with default settings
-dia --text "[S1] Testing Dia-JAX. [S2] How does it sound?"
+dia --text "[S1] Dear Jacks, to generate audio from text from any machine. (applause) [S2] Really? How! (screams) [S1] With flakes and an axe. (chuckles)"
 
 # Or with custom parameters
-dia --text "[S1] Another test. [S2] With different settings." \
-    --output custom.mp3 \
-    --temperature 1.0 \
-    --seed 42
+dia --temperature 0.7 --cfg-filter-top-k 42
 ```
 ### As a Python Library
 
 ```python
 import diajax
-model, config = diajax.load('jaco-bro/Dia-1.6B')
+model, config = diajax.load()
 output = diajax.generate(model, config, text)
 
 import soundfile as sf
