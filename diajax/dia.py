@@ -9,7 +9,6 @@ from flax import nnx
 from huggingface_hub import hf_hub_download
 from safetensors.numpy import load_file
 from . import audio
-# import audio
 
 class DataConfig(BaseModel):
     text_length: int = Field(gt=0)
@@ -186,24 +185,24 @@ class Attention(nnx.Module):
         self.o_proj = nnx.LinearGeneral(in_features=(num_query_heads, head_dim), out_features=self.output_dim, axis=(-2, -1), use_bias=False, rngs=rngs)
     
     @nnx.jit
-    def __call__(self, x, rope_cos, rope_sin, attn_mask=None, kv_cache=None):
+    def __call__(self, x, rope_cos, rope_sin, attn_mask, k_cache, v_cache):
         q = self.q_proj(x)
         q = apply_rope(q, rope_cos, rope_sin)
         q = jnp.transpose(q, (0, 2, 1, 3))
         if self.is_cross_attn:
-            k, v = kv_cache
+            k, v = k_cache, v_cache
+            _k, _v = None, None
         else:
-            k = self.k_proj(x)
-            v = self.v_proj(x)
-            k = apply_rope(k, rope_cos, rope_sin)
-            k = jnp.transpose(k, (0, 2, 1, 3))
-            v = jnp.transpose(v, (0, 2, 1, 3))
+            _k = self.k_proj(x)
+            _v = self.v_proj(x)
+            _k = apply_rope(_k, rope_cos, rope_sin)
+            _k = jnp.transpose(_k, (0, 2, 1, 3))
+            _v = jnp.transpose(_v, (0, 2, 1, 3))
+            k = jnp.concatenate([k_cache, _k], axis=2)
+            v = jnp.concatenate([v_cache, _v], axis=2)
             if self.num_gqa_groups > 1:
                 k = jnp.repeat(k, self.num_gqa_groups, axis=1)
                 v = jnp.repeat(v, self.num_gqa_groups, axis=1)
-            if kv_cache is not None:
-                k = jnp.concatenate([kv_cache[0], k], axis=2)
-                v = jnp.concatenate([kv_cache[1], v], axis=2)
         w = jnp.matmul(q, jnp.transpose(k, (0, 1, 3, 2)))
         if attn_mask is not None:
             w = w + attn_mask
@@ -211,7 +210,7 @@ class Attention(nnx.Module):
         w = jnp.matmul(w, v)
         w = jnp.transpose(w, (0, 2, 1, 3))
         output = self.o_proj(w)
-        return output, (k, v)
+        return output, _k, _v
 
 class EncoderLayer(nnx.Module):
     def __init__(self, config, *, rngs: nnx.Rngs):
@@ -227,7 +226,8 @@ class EncoderLayer(nnx.Module):
     @nnx.jit
     def __call__(self, x, attn_mask=None, rope_cos=None, rope_sin=None):
         residual = x
-        sa_out, _ = self.self_attention(x=self.pre_sa_norm(x), rope_cos=rope_cos, rope_sin=rope_sin, attn_mask=attn_mask)        
+        _e = jnp.empty((2,16,0,128), dtype=x.dtype)
+        sa_out, _, _ = self.self_attention(x=self.pre_sa_norm(x), rope_cos=rope_cos, rope_sin=rope_sin, attn_mask=attn_mask, k_cache=_e, v_cache=_e)  
         x = residual + sa_out
         residual = x
         return residual + self.mlp(self.post_sa_norm(x))
@@ -266,19 +266,20 @@ class DecoderLayer(nnx.Module):
     
     @nnx.jit
     def __call__(self, x, self_attn_mask, cross_attn_mask, self_rope_cos, self_rope_sin, cross_rope_cos, cross_rope_sin, self_attn_cache, cross_attn_cache):
+        k_cache, v_cache=self_attn_cache # [] ad hoc
         residual = x
         x_norm = self.pre_sa_norm(x)
-        sa_out, new_kv = self.self_attention(x=x_norm, rope_cos=self_rope_cos, rope_sin=self_rope_sin, attn_mask=self_attn_mask, kv_cache=self_attn_cache)
+        sa_out, _k, _v = self.self_attention(x=x_norm, rope_cos=self_rope_cos, rope_sin=self_rope_sin, attn_mask=self_attn_mask, k_cache=k_cache, v_cache=v_cache)
         x = residual + sa_out
         residual = x
         x_norm = self.pre_ca_norm(x)
-        ca_out, _ = self.cross_attention(x=x_norm, rope_cos=cross_rope_cos, rope_sin=cross_rope_sin, attn_mask=cross_attn_mask, kv_cache=cross_attn_cache)
+        ca_out, _, _ = self.cross_attention(x=x_norm, rope_cos=cross_rope_cos, rope_sin=cross_rope_sin, attn_mask=cross_attn_mask, k_cache=cross_attn_cache[0], v_cache=cross_attn_cache[1])
         x = residual + ca_out
         residual = x
         x_norm = self.pre_mlp_norm(x)
         mlp_out = self.mlp(x_norm)
         x = residual + mlp_out
-        return x, new_kv
+        return x, _k, _v
 
 class Decoder(nnx.Module):
     def __init__(self, config, *, rngs: nnx.Rngs):
@@ -303,8 +304,12 @@ class Decoder(nnx.Module):
             x = channel_embed if x is None else x + channel_embed
         new_self_kv_caches = [] # [] vmap
         for i, layer in enumerate(self.layers):
-            x, new_kv = layer(x, self_attn_mask=self_attn_mask, cross_attn_mask=cross_attn_mask, self_rope_cos=self_rope_cos, self_rope_sin=self_rope_sin, cross_rope_cos=cross_rope_cos, cross_rope_sin=cross_rope_sin, self_attn_cache=self_kv_caches[i], cross_attn_cache=cross_kv_caches[i])
-            new_self_kv_caches.append(new_kv)
+            self_kv_cache = self_kv_caches[i]
+            x, _k, _v = layer(x, self_attn_mask=self_attn_mask, cross_attn_mask=cross_attn_mask, self_rope_cos=self_rope_cos, self_rope_sin=self_rope_sin, cross_rope_cos=cross_rope_cos, cross_rope_sin=cross_rope_sin, self_attn_cache=self_kv_cache, cross_attn_cache=cross_kv_caches[i])
+            if self_kv_cache is not None:
+                _k = jnp.concatenate([self_kv_cache[0], _k], axis=2)
+                _v = jnp.concatenate([self_kv_cache[1], _v], axis=2)
+            new_self_kv_caches.append((_k, _v))
         x = self.norm(x)
         logits_Bx1xCxV = self.logits_dense(x)
         return logits_Bx1xCxV, new_self_kv_caches
@@ -384,7 +389,8 @@ def generate(model, config, text, audio_prompt=None, max_tokens=None, cfg_scale=
     dec_cross_roper = Roper(head_dim=config.model.decoder.cross_head_dim, min_timescale=config.model.rope_min_timescale, max_timescale=config.model.rope_max_timescale)
     enc_rope_cos, enc_rope_sin = enc_roper(src_positions_BxS)
     encoder_out = model.encoder(x_ids=src_BxS, attn_mask=enc_self_attn_mask, rope_cos=enc_rope_cos, rope_sin=enc_rope_sin)
-    self_kv_caches = [None]*len(model.decoder.layers)
+    _e = jnp.empty((2,4,0,128), dtype=jnp.bfloat16)
+    self_kv_caches = [(_e, _e)]*len(model.decoder.layers) 
     dec_cross_kv_cos, dec_cross_kv_sin = dec_cross_roper(src_positions_BxS)
     cross_kv_caches = model.decoder.precompute_cross_attention_kv(max_tokens, encoder_out, dec_cross_kv_cos, dec_cross_kv_sin)
     prompt_len_inc_bos = 1
@@ -408,7 +414,7 @@ def generate(model, config, text, audio_prompt=None, max_tokens=None, cfg_scale=
     extra_steps_after_eos = 30
     V = config.model.tgt_vocab_size
     vocab_mask = jnp.arange(V) > 1024
-    for step in range(current_step, current_step + min(600, max_tokens)): # DEBUG
+    for step in range(current_step, current_step + min(800, max_tokens)): # DEBUG
         _, key = jax.random.split(key)
         tgt_pos_Bx1 = jnp.full((2, 1), fill_value=step, dtype=jnp.int32)
         self_rope_cos, self_rope_sin = dec_self_roper(tgt_pos_Bx1)
@@ -458,7 +464,7 @@ def load(model_name='jaco-bro/Dia-1.6B'):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Dia-JAX: Generate dialogue audio from text')
-    parser.add_argument('--text', type=str, default="[S1] Dear Jacks, to generate audio from text from any machine. [S2] Any machine? (gasps) How? [S1] With flakes and an axe. (chuckle) ",
+    parser.add_argument('--text', type=str, default="[S1] Dear Jacks, to generate audio from text from any machine. [S2] Any machine? (laughs) How? [S1] With flakes and an axe. (chuckle) ",
                         help='Input text with [S1] and [S2] speaker tags'),
     parser.add_argument('--audio', type=str, default=None, 
                         help='Input audio prompt filename to voice clone)')
@@ -504,4 +510,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

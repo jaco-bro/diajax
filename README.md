@@ -4,8 +4,6 @@
 
 ## Quickstart
 
-**Note: Currently only recommended for experimental/development use due to memory issues**
-
 [output.mp3](https://raw.githubusercontent.com/jaco-bro/diajax/main/assets/example_output.mp3)
 
 ```bash
