@@ -10,7 +10,7 @@
 
 ```bash
 pip install diajax
-dia --text "[S1] Dear Jacks, to generate audio from text from any machine. (applause) [S2] Really? (screams) How! [S1] With flakes and an axe. (chuckles)"
+dia --text "[S1] Dear Jacks, to generate audio from text from any machine. [S2] Any machine? (gasps) How? [S1] With flakes and an axe. (chuckle) " --max-tokens=100
 ```
 
 ```python

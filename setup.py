@@ -17,7 +17,7 @@ setup(
     name='diajax',
     url='https://github.com/jaco-bro/diajax',
     packages=find_packages(),
-    version='0.0.2a2',
+    version='0.0.2',
     readme="README.md",
     author_email="backupjjoe@gmail.com",
     description="Dia-JAX: A JAX port of Dia, the text-to-speech model for generating realistic dialogue from text with emotion and tone control.",

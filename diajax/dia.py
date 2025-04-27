@@ -9,6 +9,7 @@ from flax import nnx
 from huggingface_hub import hf_hub_download
 from safetensors.numpy import load_file
 from . import audio
+# import audio
 
 class DataConfig(BaseModel):
     text_length: int = Field(gt=0)
@@ -407,7 +408,7 @@ def generate(model, config, text, audio_prompt=None, max_tokens=None, cfg_scale=
     extra_steps_after_eos = 30
     V = config.model.tgt_vocab_size
     vocab_mask = jnp.arange(V) > 1024
-    for step in range(current_step, current_step + 600): # DEBUG
+    for step in range(current_step, current_step + min(600, max_tokens)): # DEBUG
         _, key = jax.random.split(key)
         tgt_pos_Bx1 = jnp.full((2, 1), fill_value=step, dtype=jnp.int32)
         self_rope_cos, self_rope_sin = dec_self_roper(tgt_pos_Bx1)
@@ -498,7 +499,7 @@ def main():
         seed=args.seed
     )
     del model
-    print(f"Saving audio saved to {args.output}")
+    print(f"Audio saved to {args.output}")
     save(output, args.output)
 
 if __name__ == "__main__":
