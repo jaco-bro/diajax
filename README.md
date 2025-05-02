@@ -4,10 +4,12 @@
 
 ## Quickstart
 
+**Note: Currently only recommended for experimental/development use due to memory issues**
+
 [output.mp3](https://raw.githubusercontent.com/jaco-bro/diajax/main/assets/example_output.mp3)
 
 ```bash
-pip install diajax
+pip install -U diajax
 dia --text "[S1] Dear Jacks, to generate audio from text from any machine. [S2] Any machine? (gasps) How? [S1] With flakes and an axe. (chuckle) " --max-tokens=100
 ```
 

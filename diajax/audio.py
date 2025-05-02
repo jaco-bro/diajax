@@ -58,6 +58,9 @@ def get_audio_prompt(audio_prompt_path, *, c=9, p=1025, b=1026, d=[0, 8, 9, 10, 
         audio_prompt, sr = torchaudio.load(audio_prompt_path, channels_first=True)  # C, T
         if sr != 44100:  # Resample to 44.1kHz
             audio_prompt = torchaudio.functional.resample(audio_prompt, sr, 44100)
+        if audio_prompt.shape[0] > 1:
+            audio_prompt = torch.mean(audio_prompt, dim=0, keepdim=True)  # Now shape is (1, T)
+        audio_prompt = audio_prompt[:,:3*44100]
         audio_prompt = audio_prompt.to(device).unsqueeze(0)  # 1, C, T
         audio_prompt = audio_to_codebook(model, audio_prompt, c, p, b, d)
         generated_BxTxC = torch.cat([generated_BxTxC, audio_prompt.expand(2, -1, -1)], dim=1)
