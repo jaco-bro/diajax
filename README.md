@@ -15,7 +15,7 @@ dia --text "[S1] Dear Jacks, to generate audio from text from any machine. [S2] 
 
 ```python
 import diajax
-model, config = diajax.load()
+model = diajax.load()
 output = diajax.generate(model, "[S1] Dear Jacks, to generate audio from text from any machine. [S2] Any machine? (laughs) How? [S1] With flacks and an axe. (coughs)")
 diajax.save(output)
 ```
