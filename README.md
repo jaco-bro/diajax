@@ -1,10 +1,10 @@
 # Dia-JAX
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jaco-bro/diajax/blob/main/assets/diajax_TPU.ipynb)
+
 **An experimental JAX port of Dia, the 1.6B parameter text-to-speech model from Nari Labs**
 
 ## Quickstart
-
-**Note: Currently only recommended for experimental/development use due to memory issues**
 
 [output.mp3](https://raw.githubusercontent.com/jaco-bro/diajax/main/assets/example_output.mp3)
 
@@ -16,7 +16,7 @@ dia --text "[S1] Dear Jacks, to generate audio from text from any machine. [S2] 
 ```python
 import diajax
 model, config = diajax.load()
-output = diajax.generate(model, config, text)
+output = diajax.generate(model, "[S1] Dear Jacks, to generate audio from text from any machine. [S2] Any machine? (laughs) How? [S1] With flacks and an axe. (coughs)")
 diajax.save(output)
 ```
 
