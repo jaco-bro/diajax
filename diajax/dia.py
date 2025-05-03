@@ -386,7 +386,7 @@ class Carry(nnx.Module):
         self.caches=caches
         self.penalty=nnx.Variable(jnp.array(penalty, dtype=jnp.bfloat16))
 
-def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, temperature=0.7, top_p=0.95, use_cfg_filter=True, cfg_filter_top_k=35, seed=0, scan_batch_size=500, use_scan=False):
+def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, temperature=0.7, top_p=0.95, use_cfg_filter=True, cfg_filter_top_k=35, seed=0, scan_batch_size=500, use_scan=False, use_jit=False):
     tic = time.perf_counter()
     config = model.config
     key = jax.random.PRNGKey(seed)
@@ -398,6 +398,7 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
     max_tokens = config.data.audio_length if max_tokens is None else min(max_tokens, config.data.audio_length)
     delay_tensor = jnp.array(delay_pattern, dtype=jnp.int32)
     max_delay_pattern = max(delay_pattern)
+    text = text.strip() if audio_prompt is None else '(mumbles)' + text.strip()
     byte_text = text.encode("utf-8")
     replaced_bytes = byte_text.replace(b"[S1]", b"\x01").replace(b"[S2]", b"\x02")
     text_tokens = list(replaced_bytes)
@@ -444,6 +445,7 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
     # carry = Carry(tok[:, :1, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
     # carry = Carry(tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
     # c0, carry_1 = nnx.split(carry)
+    # carry_1 = (tok[:, :1, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
     carry_1 = (tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
     # @nnx.jit
     def decode_fn(c1, key):
@@ -463,6 +465,7 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
         cfg_logits = cond + cfg_scale * (cond - uncond)
         logits_CV = cfg_logits[:,:1025]
         pred_C = sample_next_token(temperature, top_p, cfg_filter_top_k, logits_CV/(1.0+penalty), key)
+        # delay_mask = g_step >= delay_tensor
         delay_mask = idx >= delay_tensor
         pred_C = jnp.where(delay_mask, pred_C, audio_bos_value)
         next_tok = jnp.broadcast_to(pred_C[None, None, :], (2, 1, num_channels))
@@ -477,7 +480,10 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
     if use_scan:
         scan_fn = nnx.scan(decode_fn, in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
     else:
-        _decode_fn = nnx.jit(decode_fn)
+        if use_jit:
+            _decode_fn = nnx.jit(decode_fn)
+        else:
+            _decode_fn = decode_fn
         def not_scan(carry, keys):
             outputs = []
             for key in keys:
@@ -541,7 +547,10 @@ def main():
                         help='Bigger the faster but beware the crash')
     parser.add_argument('--use-scan', action='store_true', dest='use_scan',
                         help='Enable flax.nnx.scan (Dont try on mac; jax-metal is broken)')
+    parser.add_argument('--use-jit', action='store_true', dest='use_jit',
+                        help='Jit decode_fn when using plain loop for token generation (noop if --use-scan)')
     args = parser.parse_args()
+    print(f'{args.audio=}')
     audio_prompt = jnp.array(audio.get_audio_prompt(args.audio), dtype=jnp.int32) if args.audio is not None else None
     print(f"Loading model from {args.model}...")
     model = load(args.model)
@@ -559,6 +568,7 @@ def main():
         seed=args.seed,
         scan_batch_size=args.scan_batch_size,
         use_scan=args.use_scan,
+        use_jit=args.use_jit,
     )
     del model
     print(f"Audio saved to {args.output}")
