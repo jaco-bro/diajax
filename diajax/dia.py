@@ -36,7 +36,7 @@ class DecoderConfig(BaseModel):
     n_embd: int = Field(gt=0)
     n_hidden: int = Field(gt=0)
     gqa_query_heads: int = Field(gt=0)
-    sow_len: int = Field(default=3000) # ad hoc
+    sow_len: int = Field(default=1024) # ad hoc
     kv_heads: int = Field(gt=0)
     gqa_head_dim: int = Field(gt=0)
     cross_query_heads: int = Field(gt=0)
@@ -118,7 +118,7 @@ def codebook_to_audio(generated_codes, delay_pattern, B=1, T=2600, C=9):
     codebook = jnp.where(invalid_mask, jnp.zeros_like(codebook), codebook)
     return np.array(codebook)
 
-def save(codebook, filename='out_diajax.mp3', sr=44100):
+def save(codebook, filename='output.mp3', sr=44100):
     import soundfile as sf
     output = audio.get_audio_values(codebook)
     sf.write(filename, output, sr)
@@ -386,7 +386,7 @@ class Carry(nnx.Module):
         self.caches=caches
         self.penalty=nnx.Variable(jnp.array(penalty, dtype=jnp.bfloat16))
 
-def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, temperature=0.7, top_p=0.95, use_cfg_filter=True, cfg_filter_top_k=35, seed=0, scan_batch_size=500):
+def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, temperature=0.7, top_p=0.95, use_cfg_filter=True, cfg_filter_top_k=35, seed=0, scan_batch_size=500, use_scan=False):
     tic = time.perf_counter()
     config = model.config
     key = jax.random.PRNGKey(seed)
@@ -439,14 +439,17 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
     eos_detected_channel_0 = False
     eos_countdown = -1
     extra_steps_after_eos = 30
-    _sample = functools.partial(sample_next_token, temperature, top_p, cfg_filter_top_k) if temperature > 0.01 else lambda x,_:jnp.argmax(x, axis=-1)
+    # _sample = functools.partial(sample_next_token, temperature, top_p, cfg_filter_top_k) if temperature > 0.01 else lambda x,_:jnp.argmax(x, axis=-1)
     V = config.model.tgt_vocab_size
-    benchmark_enc = time.perf_counter() - tic
-    tic = time.perf_counter()
-    @nnx.jit
-    def decode_fn(model, c0, c1, key):
-        _carry = nnx.merge(c0, c1)
-        tok, idx, caches, penalty = _carry()
+    # carry = Carry(tok[:, :1, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
+    # carry = Carry(tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
+    # c0, carry_1 = nnx.split(carry)
+    carry_1 = (tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
+    # @nnx.jit
+    def decode_fn(c1, key):
+        # _carry = nnx.merge(c0, c1)
+        # tok, idx, caches, penalty = _carry()
+        tok, idx, caches, penalty = c1
         step = idx + 1
         g_step = idx-current_step
         # pos = jnp.full((2, 1), g_step, dtype=jnp.int32)
@@ -459,48 +462,50 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
         uncond, cond = logits_last[0], logits_last[1]
         cfg_logits = cond + cfg_scale * (cond - uncond)
         logits_CV = cfg_logits[:,:1025]
-        # pred_C = _sample(logits_CV/(1+penalty), key)
         pred_C = sample_next_token(temperature, top_p, cfg_filter_top_k, logits_CV/(1.0+penalty), key)
-        # print(f'{pred_C=}')
-        # delay_mask = g_step >= delay_tensor
         delay_mask = idx >= delay_tensor
         pred_C = jnp.where(delay_mask, pred_C, audio_bos_value)
         next_tok = jnp.broadcast_to(pred_C[None, None, :], (2, 1, num_channels))
         rep_penalty = jnp.all(tok == next_tok).astype(jnp.bfloat16)
-        _carry.set(next_tok, step, caches, rep_penalty)
-        _, _c1 = nnx.split(_carry)
-        return _c1, pred_C
-
-    # carry = Carry(tok[:, :1, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, 0.0)
-    carry = Carry(tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, 0.0)
-    carry_0, carry_1 = nnx.split(carry)
-    keys = jax.random.split(key, scan_batch_size+1)
+        # _carry.set(next_tok, step, caches, rep_penalty)
+        # _, _c1 = nnx.split(_carry)
+        # return _c1, pred_C
+        return (next_tok, step, caches, rep_penalty), pred_C
     # _decode_fn = functools.partial(decode_fn, model, carry_0)
-    _decode_fn = nnx.cached_partial(decode_fn, model, carry_0)
-    def not_scan(carry, keys):
-        outputs = []
-        for key in keys:
-            carry, output = _decode_fn(carry, key)
-            outputs.append(output)
-            if output[0] == audio_eos_value:
-                break
-        stacked_outputs = jnp.stack(outputs, axis=0) if outputs else jnp.array([])
-        return carry, stacked_outputs
+    # _decode_fn = nnx.cached_partial(decode_fn, model, carry_0)
     result = []
-    for i in range(max_tokens//scan_batch_size+1):
-        carry_1, outputs = not_scan(carry_1,  keys[:-1])  # 1. loop
-        # carry_1, outputs = jax.lax.scan(_decode_fn, carry_1, keys[:-1])  # 2. lax
-        # carry_1, outputs = nnx.scan(decode_fn, in_axes=(None, None, nnx.Carry, 0), out_axes=(nnx.Carry, 0))(model, carry_0, carry_1, keys[:-1])  # 3. nnx
+    if use_scan:
+        scan_fn = nnx.scan(decode_fn, in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    else:
+        _decode_fn = nnx.jit(decode_fn)
+        def not_scan(carry, keys):
+            outputs = []
+            for key in keys:
+                carry, output = _decode_fn(carry, key)
+                outputs.append(output)
+                if output[0] == audio_eos_value:
+                    break
+            stacked_outputs = jnp.stack(outputs, axis=0) if outputs else jnp.array([])
+            return carry, stacked_outputs
+        scan_fn = not_scan
+    benchmark_enc = time.perf_counter() - tic
+    tic = time.perf_counter()
+    remaining = max_tokens
+    while remaining > 0:
+        current_batch_size = min(scan_batch_size, remaining)
+        keys = jax.random.split(key, current_batch_size + 1)
+        carry_1, outputs = scan_fn(carry_1, keys[:-1])
         eos_indices = jnp.where(outputs[:, 0] == audio_eos_value)[0]
         if eos_indices.size > 0:
             result.append(outputs[:eos_indices[0]+1])
             break
         else:
             result.append(outputs)
-            keys = jax.random.split(keys[-1], scan_batch_size+1)
+            key = keys[-1]
+            remaining -= current_batch_size
+    benchmark_time = time.perf_counter() - tic
     result = jnp.concat(result).T
     benchmark_step = result.size/9
-    benchmark_time = time.perf_counter() - tic
     benchmark_tps = benchmark_step / benchmark_time
     print(f'{benchmark_enc:.2f} seconds in starting up\n{benchmark_tps:.2f} tokens-per-second ({benchmark_step} tokens in {benchmark_time:.2f} seconds)')
     return codebook_to_audio(result, delay_pattern, B=1, T=max_tokens, C=num_channels)
@@ -532,10 +537,10 @@ def main():
                         help='Disable CFG filtering')
     parser.add_argument('--cfg-filter-top-k', type=int, default=35,
                         help='Top-k for CFG filtering')
-    parser.add_argument('--scan-batch-size', type=int, default=200,
+    parser.add_argument('--scan-batch-size', type=int, default=100,
                         help='Bigger the faster but beware the crash')
-    parser.add_argument('--scan-option', type=str, default='nnx',
-                        help='Scan option (todo, nnx and lax arent working properly yet)')
+    parser.add_argument('--use-scan', action='store_true', dest='use_scan',
+                        help='Enable flax.nnx.scan (Dont try on mac; jax-metal is broken)')
     args = parser.parse_args()
     audio_prompt = jnp.array(audio.get_audio_prompt(args.audio), dtype=jnp.int32) if args.audio is not None else None
     print(f"Loading model from {args.model}...")
@@ -553,6 +558,7 @@ def main():
         cfg_filter_top_k=args.cfg_filter_top_k,
         seed=args.seed,
         scan_batch_size=args.scan_batch_size,
+        use_scan=args.use_scan,
     )
     del model
     print(f"Audio saved to {args.output}")
