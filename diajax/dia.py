@@ -1,7 +1,10 @@
+# import warnings
+# warnings.filterwarnings("error", category=RuntimeWarning) 
 import functools
 import os
 import time
-from typing import List, Dict, Union, Optional, Tuple, Callable, Any
+import re
+from typing import List, Dict, Union, Optional, Tuple, Callable, Any, Literal
 from pydantic import BaseModel, Field
 import jax
 import jax.numpy as jnp
@@ -11,6 +14,59 @@ from huggingface_hub import hf_hub_download
 from safetensors.numpy import load_file
 from . import audio
 # import audio # DEBUG
+
+def bf16vf16(size=1024, perf_threshold= 1.5, runs=5):
+    @jax.jit
+    def small_bf16_matmul(x):
+        return x @ x
+    sample = jnp.ones((4, 4), dtype=jnp.bfloat16)
+    lowered = small_bf16_matmul.lower(sample)
+    try:
+        ir = lowered.compiler_ir(dialect="hlo")
+    except TypeError:
+        ir = lowered.compiler_ir()
+    if isinstance(ir, dict):
+        hlo_text = ir.get("hlo_text", "") or ir.get("hlo", "")
+    elif hasattr(ir, "as_hlo_text"):
+        hlo_text = ir.as_hlo_text()
+    else:
+        hlo_text = str(ir)
+    hlo_pattern = re.compile(r"=\s*bf16\[\d+,\d+\](?:\{[^\}]+\})?\s+dot\(")
+    hlo_ok = bool(hlo_pattern.search(hlo_text))
+    @jax.jit
+    def matmul(x):
+        return x @ x
+    def avg_time(x):
+        matmul(x).block_until_ready()
+        total = 0.0
+        for _ in range(runs):
+            t0 = time.time()
+            matmul(x).block_until_ready()
+            total += (time.time() - t0)
+        return total / runs
+    x_f32  = jnp.ones((size, size), dtype=jnp.float32)
+    x_f16  = jnp.ones((size, size), dtype=jnp.float16)
+    x_bf16 = jnp.ones((size, size), dtype=jnp.bfloat16)
+    bf16_time = avg_time(x_bf16)
+    f32_time  = avg_time(x_f32)
+    f16_time  = avg_time(x_f16)
+    bfok = (bf16_time <= f16_time * perf_threshold)
+    print(f"HLO check passed?         {hlo_ok}")
+    print(f"BF16/FP32 time ratio:     {bf16_time / f32_time:.2f}")
+    print(f"BF16/FP16 time ratio:     {bf16_time / f16_time:.2f}")
+    print(f"FP16/FP32 time ratio:     {f16_time / f32_time:.2f}")
+    print(f"Performance check?        {bfok}")
+    return 'bfloat16' if bfok else 'float16'
+
+dtype_lookup = {
+    "bfloat16": jnp.bfloat16,
+    "float16": jnp.float16,
+    "float32": jnp.float32,
+}
+
+def get_dtype(dtype_str):
+    # _ = bf16vf16()
+    return dtype_lookup.get(dtype_str, bf16vf16())
 
 class DataConfig(BaseModel):
     text_length: int = Field(gt=0)
@@ -36,7 +92,6 @@ class DecoderConfig(BaseModel):
     n_embd: int = Field(gt=0)
     n_hidden: int = Field(gt=0)
     gqa_query_heads: int = Field(gt=0)
-    sow_len: int = Field(default=1024) # ad hoc
     kv_heads: int = Field(gt=0)
     gqa_head_dim: int = Field(gt=0)
     cross_query_heads: int = Field(gt=0)
@@ -64,6 +119,11 @@ class DiaConfig(BaseModel):
     model: ModelConfig
     training: TrainingConfig
     data: DataConfig
+    DT: Optional[Literal["float32", "float16", "bfloat16"]] = Field(default=None)
+
+    @property
+    def dtype(self):
+        return dtype_lookup[self.DT]
 
     @classmethod
     def load(cls, path: str):
@@ -74,7 +134,7 @@ class DiaConfig(BaseModel):
                 return cls.model_validate(json.loads(content))
         except FileNotFoundError:
             return None
-    
+
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         import json
@@ -123,16 +183,19 @@ def save(codebook, filename='output.mp3', sr=44100):
     output = audio.get_audio_values(codebook)
     sf.write(filename, output, sr)
 
-def load(model_name='jaco-bro/Dia-1.6B', dtype=jnp.bfloat16):
+def load(model_name='jaco-bro/Dia-1.6B', dtype=None):
     config_path = hf_hub_download(repo_id=model_name, filename="config.json")
-    checkpoint_path = hf_hub_download(repo_id=model_name, filename="model.safetensors")
     config = DiaConfig.load(config_path)
+    config.DT = get_dtype(dtype)
+    # model_name = model_name+'-'+dtype if 'float16' in dtype else model_name
+    checkpoint_path = hf_hub_download(repo_id=model_name, filename="model.safetensors")
+    # checkpoint_path = "../model.safetensors"
     graphdef, state = nnx.split(nnx.eval_shape(lambda: DiaModel(config, rngs=nnx.Rngs(0))))
     state_dict = dict(state.flat_state())
     for path, val in ((k.replace('weight', 'embedding') if 'embeddings' in k else k.replace("norm.weight", "norm.scale").replace("proj.weight", "proj.kernel").replace("wi_fused.weight", "wi_fused.kernel").replace("wo.weight", "wo.kernel").replace("embedding.weight", "embedding.embedding").replace('logits_dense.weight', 'logits_dense.kernel'), nnx.Param(jnp.array(v))) for k, v in load_file(checkpoint_path).items()):
-        state_dict[tuple(int(part) if part.isdigit() else part for part in path.split('.'))].value = jnp.array(val, dtype=jnp.bfloat16)
+        state_dict[tuple(int(part) if part.isdigit() else part for part in path.split('.'))].value = jnp.array(val, dtype=config.dtype)
     model = nnx.merge(graphdef, nnx.State.from_flat_path(state_dict))
-    model.set_attributes(dtype=dtype, param_dtype=dtype)
+    model.set_attributes(dtype=config.dtype, param_dtype=config.dtype)
     return model
 
 @nnx.jit
@@ -143,20 +206,20 @@ def sample_next_token(temperature, top_p, cfg_filter_top_k, logits, rng_key):
     batch_size, vocab_size = logits.shape
     top_k_mask = jnp.arange(vocab_size) < cfg_filter_top_k
     top_k_mask = jnp.broadcast_to(top_k_mask, (batch_size, vocab_size))
-    filtered_logits = jnp.where(top_k_mask, sorted_logits, -1e9)
+    filtered_logits = jnp.where(top_k_mask, sorted_logits, -jnp.inf)
     probs = jax.nn.softmax(filtered_logits, axis=-1)
     cumulative_probs = jnp.cumsum(probs, axis=-1)
     top_p_mask = cumulative_probs <= top_p
     top_p_mask = top_p_mask | (jnp.arange(vocab_size) == 0).reshape(1, -1)
-    final_logits = jnp.where(top_p_mask, filtered_logits, -1e9)
-    final_logits_original = jnp.zeros_like(logits) - 1e9
+    final_logits = jnp.where(top_p_mask, filtered_logits, -jnp.inf)
+    final_logits_original = jnp.zeros_like(logits) - jnp.inf 
     final_logits_original = final_logits_original.at[jnp.arange(batch_size)[:, None], sorted_indices].set(final_logits)
     return jax.random.categorical(rng_key, final_logits_original)
 
 @nnx.jit
 def apply_rope(k, cos, sin):
     k1, k2 = jnp.split(k, 2, axis=-1)
-    return jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1).astype(jnp.bfloat16)
+    return jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
 
 @nnx.jit
 def create_attention_mask(q_padding_mask, k_padding_mask):
@@ -168,7 +231,7 @@ def create_attention_mask(q_padding_mask, k_padding_mask):
     pad_attends_pad = (~q_mask_BxTqx1) & (~k_mask_Bx1xTk)
     mask = non_pad_attends_non_pad | pad_attends_pad
     mask = jnp.where(mask, 0.0, -1e9)
-    return mask[:, None, :, :].astype(jnp.bfloat16)
+    return mask[:, None, :, :]
 
 def create_causal_mask(q_padding_mask, k_padding_mask, s):
     B1, Tq = q_padding_mask.shape
@@ -183,7 +246,7 @@ def create_causal_mask(q_padding_mask, k_padding_mask, s):
     mask = mask & causal_mask
     mask = jnp.where(mask, 0.0, -1e9)
     mask = jnp.pad(mask, ((0,0),(0,0),(_Tk,0)), constant_values=-1e9)
-    return mask[:, None, :, -s:].astype(jnp.bfloat16)
+    return mask[:, None, :, -s:]
 
 class Roper(nnx.Module):
     def __init__(self, head_dim, min_timescale=1, max_timescale=10000):
@@ -209,11 +272,12 @@ class MlpBlock(nnx.Module):
         return self.wo(nnx.silu(fused_x[..., 0, :]) * fused_x[..., 1, :])
 
 class BufCache(nnx.Module):
-    def __init__(self, num_heads, max_len, head_dim, k=None, v=None):
+    def __init__(self, dtype, num_heads, max_len, head_dim, k=None, v=None):
         self.max_len = max_len
-        self.k = nnx.Variable(jnp.zeros((2, num_heads, max_len, head_dim), dtype=jnp.bfloat16)) if k is None else nnx.Variable(k)
-        self.v = nnx.Variable(jnp.zeros((2, num_heads, max_len, head_dim), dtype=jnp.bfloat16)) if v is None else nnx.Variable(v)
+        self.k = nnx.Variable(jnp.zeros((2, num_heads, max_len, head_dim), dtype=dtype)) if k is None else nnx.Variable(k)
+        self.v = nnx.Variable(jnp.zeros((2, num_heads, max_len, head_dim), dtype=dtype)) if v is None else nnx.Variable(v)
 
+    @nnx.jit
     def __call__(self, k, v):
         self.k.value = jnp.concat([self.k.value, k], axis=2)[:,:,-self.max_len:,:]
         self.v.value = jnp.concat([self.v.value, v], axis=2)[:,:,-self.max_len:,:]
@@ -225,7 +289,7 @@ class NoCache(nnx.Module):
         return k, v
 
 class Attention(nnx.Module):
-    def __init__(self, config, q_embed_dim, kv_embed_dim, num_query_heads, num_kv_heads, head_dim, dropout_rate, is_cross_attn=False, out_embed_dim=None, *, sow_len=1024, rngs: nnx.Rngs):
+    def __init__(self, config, q_embed_dim, kv_embed_dim, num_query_heads, num_kv_heads, head_dim, dropout_rate, is_cross_attn=False, out_embed_dim=None, *, rngs: nnx.Rngs):
         self.num_query_heads = num_query_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -238,19 +302,19 @@ class Attention(nnx.Module):
         self.k_proj = nnx.LinearGeneral(in_features=kv_embed_dim, out_features=(num_kv_heads, head_dim), axis=-1, use_bias=False, rngs=rngs)
         self.v_proj = nnx.LinearGeneral(in_features=kv_embed_dim, out_features=(num_kv_heads, head_dim), axis=-1, use_bias=False, rngs=rngs)
         self.o_proj = nnx.LinearGeneral(in_features=(num_query_heads, head_dim), out_features=self.output_dim, axis=(-2, -1), use_bias=False, rngs=rngs)
-        self.window_size = sow_len
+        self.dtype = config.dtype 
     
     @nnx.jit
     def __call__(self, x, rope_cos, rope_sin, attn_mask, kv_cache=None):
         q = self.q_proj(x)
-        q = apply_rope(q, rope_cos, rope_sin)
+        q = apply_rope(q, rope_cos, rope_sin).astype(self.dtype)
         q = jnp.transpose(q, (0, 2, 1, 3))
         if self.is_cross_attn:
             k, v = kv_cache
         else:
             _k = self.k_proj(x)
             _v = self.v_proj(x)
-            _k = apply_rope(_k, rope_cos, rope_sin)
+            _k = apply_rope(_k, rope_cos, rope_sin).astype(self.dtype)
             _k = jnp.transpose(_k, (0, 2, 1, 3))
             _v = jnp.transpose(_v, (0, 2, 1, 3))
             k, v = kv_cache(_k, _v)
@@ -312,7 +376,7 @@ class DecoderLayer(nnx.Module):
         self.pre_sa_norm = nnx.RMSNorm(num_features=dec_embed_dim, epsilon=model_config.normalization_layer_epsilon, rngs=rngs)
         self.pre_ca_norm = nnx.RMSNorm(num_features=dec_embed_dim, epsilon=model_config.normalization_layer_epsilon, rngs=rngs)
         self.pre_mlp_norm = nnx.RMSNorm(num_features=dec_embed_dim, epsilon=model_config.normalization_layer_epsilon, rngs=rngs)
-        self.self_attention = Attention(config=config, q_embed_dim=dec_embed_dim, kv_embed_dim=dec_embed_dim, num_query_heads=dec_config.gqa_query_heads, num_kv_heads=dec_config.kv_heads, head_dim=dec_config.gqa_head_dim, dropout_rate=model_config.dropout, is_cross_attn=False, out_embed_dim=dec_embed_dim, sow_len=dec_config.sow_len, rngs=rngs)
+        self.self_attention = Attention(config=config, q_embed_dim=dec_embed_dim, kv_embed_dim=dec_embed_dim, num_query_heads=dec_config.gqa_query_heads, num_kv_heads=dec_config.kv_heads, head_dim=dec_config.gqa_head_dim, dropout_rate=model_config.dropout, is_cross_attn=False, out_embed_dim=dec_embed_dim, rngs=rngs)
         self.cross_attention = Attention(config=config, q_embed_dim=dec_embed_dim, kv_embed_dim=enc_embed_dim,  num_query_heads=dec_config.cross_query_heads, num_kv_heads=dec_config.cross_query_heads, head_dim=dec_config.cross_head_dim, dropout_rate=model_config.dropout, is_cross_attn=True, out_embed_dim=dec_embed_dim, rngs=rngs)
         self.mlp = MlpBlock(config=config, embed_dim=dec_embed_dim, intermediate_dim=dec_config.n_hidden, use_pre_norm=dec_config.use_pre_norm, rngs=rngs)
     
@@ -345,6 +409,7 @@ class Decoder(nnx.Module):
         self.layers = [DecoderLayer(config=config, rngs=rngs) for _ in range(self.num_layers)]
         self.norm = nnx.RMSNorm(num_features=dec_config.n_embd, epsilon=model_config.normalization_layer_epsilon, rngs=rngs)
         self.logits_dense = nnx.LinearGeneral(in_features=dec_config.n_embd, out_features=(self.num_channels, model_config.tgt_vocab_size), axis=-1, use_bias=False, rngs=rngs)
+        self.dtype = config.dtype 
     
     @nnx.jit
     def __call__(self, cross_attn_mask, cross_kv_caches, tgt_ids_Bx1xC, self_rope_cos, self_rope_sin, cross_rope_cos, cross_rope_sin, self_attn_mask, self_attn_caches):
@@ -361,7 +426,7 @@ class Decoder(nnx.Module):
             l = layer.cross_attention
             k = l.k_proj(encoder_out)
             v = l.v_proj(encoder_out)
-            k = apply_rope(k, rope_cos, rope_sin)
+            k = apply_rope(k, rope_cos, rope_sin).astype(self.dtype)
             k = jnp.transpose(k, (0, 2, 1, 3))
             v = jnp.transpose(v, (0, 2, 1, 3))
             k = jnp.repeat(k, l.num_gqa_groups, axis=1)
@@ -384,7 +449,7 @@ class Carry(nnx.Module):
         self.tok=nnx.Variable(tok)
         self.idx=nnx.Variable(jnp.array(idx, dtype=jnp.int32))
         self.caches=caches
-        self.penalty=nnx.Variable(jnp.array(penalty, dtype=jnp.bfloat16))
+        self.penalty=nnx.Variable(jnp.array(penalty, dtype=jnp.float16))
 
 def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, temperature=0.7, top_p=0.95, use_cfg_filter=True, cfg_filter_top_k=35, seed=0, scan_batch_size=500, use_scan=False, use_jit=False):
     tic = time.perf_counter()
@@ -415,7 +480,7 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
     src_BxS = jnp.concatenate([unc_src_BxS, cond_src_BxS], axis=0)  # [2, S]
     src_positions_BxS = jnp.broadcast_to(cond_src_positions_BxS, (2, cond_src_positions_BxS.shape[1]))
     src_padding_mask_BxS = jnp.broadcast_to(cond_src_padding_mask_BxS, (2, cond_src_padding_mask_BxS.shape[1]))
-    enc_self_attn_mask = create_attention_mask(src_padding_mask_BxS, src_padding_mask_BxS)
+    enc_self_attn_mask = create_attention_mask(src_padding_mask_BxS, src_padding_mask_BxS).astype(config.dtype)
     enc_roper = Roper(head_dim=config.model.encoder.head_dim, min_timescale=config.model.rope_min_timescale, max_timescale=config.model.rope_max_timescale)
     dec_self_roper = Roper(head_dim=config.model.decoder.gqa_head_dim, min_timescale=config.model.rope_min_timescale, max_timescale=config.model.rope_max_timescale)
     dec_cross_roper = Roper(head_dim=config.model.decoder.cross_head_dim, min_timescale=config.model.rope_min_timescale, max_timescale=config.model.rope_max_timescale)
@@ -426,17 +491,17 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
     tok = jnp.full((2, 1, num_channels), fill_value=audio_bos_value, dtype=jnp.int32) if audio_prompt is None else audio_prompt
     prompt_len_inc_bos = prefill_len = tok.shape[1]
     prefill_tgt_padding_mask = jnp.any(tok != audio_pad_value, axis=2)
-    sow_len = config.model.decoder.sow_len
-    self_attn_caches = [BufCache(4, sow_len, 128) for _ in range(config.model.decoder.n_layer)] # !!!
-    prefill_self_attn_mask = create_causal_mask(prefill_tgt_padding_mask, prefill_tgt_padding_mask, sow_len)
-    prefill_cross_attn_mask = create_attention_mask(prefill_tgt_padding_mask, src_padding_mask_BxS)
+    sow_len = max_tokens+260
+    self_attn_caches = [BufCache(config.dtype, 4, sow_len, 128) for _ in range(config.model.decoder.n_layer)]
+    prefill_self_attn_mask = create_causal_mask(prefill_tgt_padding_mask, prefill_tgt_padding_mask, sow_len).astype(config.dtype)
+    prefill_cross_attn_mask = create_attention_mask(prefill_tgt_padding_mask, src_padding_mask_BxS).astype(config.dtype)
     prefill_tgt_pos = jnp.broadcast_to(jnp.arange(prefill_len, dtype=jnp.int32)[None, :], (2, prefill_len))
     prefill_self_cos, prefill_self_sin = dec_self_roper(prefill_tgt_pos)
     prefill_cross_cos, prefill_cross_sin = dec_cross_roper(prefill_tgt_pos)
     model.decoder(prefill_cross_attn_mask, cross_kv_caches, tok, prefill_self_cos, prefill_self_sin, prefill_cross_cos, prefill_cross_sin, prefill_self_attn_mask, self_attn_caches)
     current_step = prompt_len_inc_bos - 1
     tgt_padding_mask = jnp.ones((2, 1), dtype=bool)
-    decoder_cross_attn_mask = create_attention_mask(tgt_padding_mask, src_padding_mask_BxS)
+    decoder_cross_attn_mask = create_attention_mask(tgt_padding_mask, src_padding_mask_BxS).astype(config.dtype)
     eos_detected_channel_0 = False
     eos_countdown = -1
     extra_steps_after_eos = 30
@@ -446,8 +511,7 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
     # carry = Carry(tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
     # c0, carry_1 = nnx.split(carry)
     # carry_1 = (tok[:, :1, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
-    carry_1 = (tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
-    # @nnx.jit
+    carry_1 = (tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=config.dtype))
     def decode_fn(c1, key):
         # _carry = nnx.merge(c0, c1)
         # tok, idx, caches, penalty = _carry()
@@ -459,17 +523,18 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
         self_cos, self_sin = dec_self_roper(pos)
         cross_cos, cross_sin = dec_cross_roper(pos)
         buf_mask = jnp.arange(sow_len) >= (sow_len - step)
-        logits_B1CxV = model.decoder(decoder_cross_attn_mask, cross_kv_caches, tok, self_cos, self_sin, cross_cos, cross_sin, jnp.where(buf_mask, 0, -1e9).astype(jnp.bfloat16), caches)
+        logits_B1CxV = model.decoder(decoder_cross_attn_mask, cross_kv_caches, tok, self_cos, self_sin, cross_cos, cross_sin, jnp.where(buf_mask, 0, -1e9).astype(config.dtype), caches)
         logits_last = logits_B1CxV[:, -1, :, :]
         uncond, cond = logits_last[0], logits_last[1]
         cfg_logits = cond + cfg_scale * (cond - uncond)
         logits_CV = cfg_logits[:,:1025]
-        pred_C = sample_next_token(temperature, top_p, cfg_filter_top_k, logits_CV/(1.0+penalty), key)
+        # pred_C = sample_next_token(temperature, top_p, cfg_filter_top_k, logits_CV/(1.0+penalty), key) # overflow
+        pred_C = sample_next_token(temperature+penalty, top_p, cfg_filter_top_k, logits_CV, key)
         # delay_mask = g_step >= delay_tensor
         delay_mask = idx >= delay_tensor
         pred_C = jnp.where(delay_mask, pred_C, audio_bos_value)
         next_tok = jnp.broadcast_to(pred_C[None, None, :], (2, 1, num_channels))
-        rep_penalty = jnp.all(tok == next_tok).astype(jnp.bfloat16)
+        rep_penalty = jnp.all(tok == next_tok).astype(config.dtype)
         # _carry.set(next_tok, step, caches, rep_penalty)
         # _, _c1 = nnx.split(_carry)
         # return _c1, pred_C
@@ -503,7 +568,7 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
         carry_1, outputs = scan_fn(carry_1, keys[:-1])
         eos_indices = jnp.where(outputs[:, 0] == audio_eos_value)[0]
         if eos_indices.size > 0:
-            result.append(outputs[:eos_indices[0]+1])
+            result.append(outputs[:eos_indices[0]+30])
             break
         else:
             result.append(outputs)
@@ -529,7 +594,7 @@ def main():
                         help='Output audio filename')
     parser.add_argument('--model', type=str, default='jaco-bro/Dia-1.6B',
                         help='Model name or path')
-    parser.add_argument('--max-tokens', type=int, default=None,
+    parser.add_argument('--max-tokens', type=int, default=1000,
                         help='Maximum number of tokens to generate')
     parser.add_argument('--cfg-scale', type=float, default=3.0,
                         help='CFG scale for generation')
@@ -549,11 +614,14 @@ def main():
                         help='Enable flax.nnx.scan (Dont try on mac; jax-metal is broken)')
     parser.add_argument('--use-jit', action='store_true', dest='use_jit',
                         help='Jit decode_fn when using plain loop for token generation (noop if --use-scan)')
+    parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16'], default=None,
+                        help='Precision to use: float32, float16, or bfloat16. '
+                             'Default is None — auto-selects between bfloat16 and float16 based on hardware support.')
     args = parser.parse_args()
     print(f'{args.audio=}')
     audio_prompt = jnp.array(audio.get_audio_prompt(args.audio), dtype=jnp.int32) if args.audio is not None else None
     print(f"Loading model from {args.model}...")
-    model = load(args.model)
+    model = load(args.model, dtype=args.dtype)
     print(f"Generating audio for text: {args.text}")
     output = generate(
         model, 
