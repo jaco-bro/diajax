@@ -65,8 +65,7 @@ dtype_lookup = {
 }
 
 def get_dtype(dtype_str):
-    # _ = bf16vf16()
-    return dtype_lookup.get(dtype_str, bf16vf16())
+    return dtype_str if dtype_str in dtype_lookup else bf16vf16()
 
 class DataConfig(BaseModel):
     text_length: int = Field(gt=0)
@@ -120,6 +119,7 @@ class DiaConfig(BaseModel):
     training: TrainingConfig
     data: DataConfig
     DT: Optional[Literal["float32", "float16", "bfloat16"]] = Field(default=None)
+    sowlen: int = Field(default=2048)
 
     @property
     def dtype(self):
@@ -187,7 +187,7 @@ def load(model_name='jaco-bro/Dia-1.6B', dtype=None):
     config_path = hf_hub_download(repo_id=model_name, filename="config.json")
     config = DiaConfig.load(config_path)
     config.DT = get_dtype(dtype)
-    # model_name = model_name+'-'+dtype if 'float16' in dtype else model_name
+    model_name = model_name+'-'+config.DT if 'float16' in config.DT else model_name
     checkpoint_path = hf_hub_download(repo_id=model_name, filename="model.safetensors")
     # checkpoint_path = "../model.safetensors"
     graphdef, state = nnx.split(nnx.eval_shape(lambda: DiaModel(config, rngs=nnx.Rngs(0))))
@@ -198,7 +198,7 @@ def load(model_name='jaco-bro/Dia-1.6B', dtype=None):
     model.set_attributes(dtype=config.dtype, param_dtype=config.dtype)
     return model
 
-@nnx.jit
+@nnx.jit(static_argnums=(0,1,2))
 def sample_next_token(temperature, top_p, cfg_filter_top_k, logits, rng_key):
     logits = logits/temperature
     sorted_indices = jnp.argsort(-logits, axis=-1)
@@ -230,7 +230,7 @@ def create_attention_mask(q_padding_mask, k_padding_mask):
     non_pad_attends_non_pad = q_mask_BxTqx1 & k_mask_Bx1xTk
     pad_attends_pad = (~q_mask_BxTqx1) & (~k_mask_Bx1xTk)
     mask = non_pad_attends_non_pad | pad_attends_pad
-    mask = jnp.where(mask, 0.0, -1e9)
+    mask = jnp.where(mask, 0.0, -1e4)
     return mask[:, None, :, :]
 
 def create_causal_mask(q_padding_mask, k_padding_mask, s):
@@ -244,8 +244,8 @@ def create_causal_mask(q_padding_mask, k_padding_mask, s):
     mask = non_pad_attends_non_pad | pad_attends_pad
     causal_mask = jnp.tril(jnp.ones((Tq, Tk), dtype=bool))
     mask = mask & causal_mask
-    mask = jnp.where(mask, 0.0, -1e9)
-    mask = jnp.pad(mask, ((0,0),(0,0),(_Tk,0)), constant_values=-1e9)
+    mask = jnp.where(mask, 0.0, -1e4)
+    mask = jnp.pad(mask, ((0,0),(0,0),(_Tk,0)), constant_values=-1e4)
     return mask[:, None, :, -s:]
 
 class Roper(nnx.Module):
@@ -290,6 +290,7 @@ class NoCache(nnx.Module):
 
 class Attention(nnx.Module):
     def __init__(self, config, q_embed_dim, kv_embed_dim, num_query_heads, num_kv_heads, head_dim, dropout_rate, is_cross_attn=False, out_embed_dim=None, *, rngs: nnx.Rngs):
+    # def __init__(self, config, q_embed_dim, kv_embed_dim, num_query_heads, num_kv_heads, head_dim, dropout_rate, is_cross_attn=False, out_embed_dim=None, sowlen=1024, *, rngs: nnx.Rngs):
         self.num_query_heads = num_query_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -303,6 +304,7 @@ class Attention(nnx.Module):
         self.v_proj = nnx.LinearGeneral(in_features=kv_embed_dim, out_features=(num_kv_heads, head_dim), axis=-1, use_bias=False, rngs=rngs)
         self.o_proj = nnx.LinearGeneral(in_features=(num_query_heads, head_dim), out_features=self.output_dim, axis=(-2, -1), use_bias=False, rngs=rngs)
         self.dtype = config.dtype 
+        # self.sowlen=sowlen
     
     @nnx.jit
     def __call__(self, x, rope_cos, rope_sin, attn_mask, kv_cache=None):
@@ -317,6 +319,9 @@ class Attention(nnx.Module):
             _k = apply_rope(_k, rope_cos, rope_sin).astype(self.dtype)
             _k = jnp.transpose(_k, (0, 2, 1, 3))
             _v = jnp.transpose(_v, (0, 2, 1, 3))
+            # self.sow(nnx.Intermediate, '_k', _k, init_fn=lambda: jnp.zeros((_k.shape[0], _k.shape[1], self.sowlen, _k.shape[3]), dtype=_k.dtype), reduce_fn=lambda prev, curr: jnp.concatenate([prev, curr], axis=2)[:, :, -self.sowlen:, :])
+            # self.sow(nnx.Intermediate, '_v', _v, init_fn=lambda: jnp.zeros((_v.shape[0], _v.shape[1], self.sowlen, _v.shape[3]), dtype=_v.dtype), reduce_fn=lambda prev, curr: jnp.concatenate([prev, curr], axis=2)[:, :, -self.sowlen:, :])
+            # k, v = self._k, self._v
             k, v = kv_cache(_k, _v)
             if self.num_gqa_groups > 1:
                 k = jnp.repeat(k, self.num_gqa_groups, axis=1)
@@ -344,6 +349,7 @@ class EncoderLayer(nnx.Module):
     def __call__(self, x, attn_mask=None, rope_cos=None, rope_sin=None):
         residual = x
         sa_out = self.self_attention(x=self.pre_sa_norm(x), rope_cos=rope_cos, rope_sin=rope_sin, attn_mask=attn_mask, kv_cache=NoCache())  
+        # sa_out = self.self_attention(x=self.pre_sa_norm(x), rope_cos=rope_cos, rope_sin=rope_sin, attn_mask=attn_mask)  
         x = residual + sa_out
         residual = x
         return residual + self.mlp(self.post_sa_norm(x))
@@ -376,15 +382,19 @@ class DecoderLayer(nnx.Module):
         self.pre_sa_norm = nnx.RMSNorm(num_features=dec_embed_dim, epsilon=model_config.normalization_layer_epsilon, rngs=rngs)
         self.pre_ca_norm = nnx.RMSNorm(num_features=dec_embed_dim, epsilon=model_config.normalization_layer_epsilon, rngs=rngs)
         self.pre_mlp_norm = nnx.RMSNorm(num_features=dec_embed_dim, epsilon=model_config.normalization_layer_epsilon, rngs=rngs)
+        # self.self_attention = Attention(config=config, q_embed_dim=dec_embed_dim, kv_embed_dim=dec_embed_dim, num_query_heads=dec_config.gqa_query_heads, num_kv_heads=dec_config.kv_heads, head_dim=dec_config.gqa_head_dim, dropout_rate=model_config.dropout, is_cross_attn=False, out_embed_dim=dec_embed_dim, sowlen=config.sowlen, rngs=rngs)
         self.self_attention = Attention(config=config, q_embed_dim=dec_embed_dim, kv_embed_dim=dec_embed_dim, num_query_heads=dec_config.gqa_query_heads, num_kv_heads=dec_config.kv_heads, head_dim=dec_config.gqa_head_dim, dropout_rate=model_config.dropout, is_cross_attn=False, out_embed_dim=dec_embed_dim, rngs=rngs)
         self.cross_attention = Attention(config=config, q_embed_dim=dec_embed_dim, kv_embed_dim=enc_embed_dim,  num_query_heads=dec_config.cross_query_heads, num_kv_heads=dec_config.cross_query_heads, head_dim=dec_config.cross_head_dim, dropout_rate=model_config.dropout, is_cross_attn=True, out_embed_dim=dec_embed_dim, rngs=rngs)
+        # self.cross_attention = Attention(config=config, q_embed_dim=dec_embed_dim, kv_embed_dim=enc_embed_dim,  num_query_heads=dec_config.cross_query_heads, num_kv_heads=dec_config.cross_query_heads, head_dim=dec_config.cross_head_dim, dropout_rate=model_config.dropout, is_cross_attn=True, out_embed_dim=dec_embed_dim, sowlen=0, rngs=rngs)
         self.mlp = MlpBlock(config=config, embed_dim=dec_embed_dim, intermediate_dim=dec_config.n_hidden, use_pre_norm=dec_config.use_pre_norm, rngs=rngs)
     
     @nnx.jit
     def __call__(self, x, self_attn_mask, cross_attn_mask, self_rope_cos, self_rope_sin, cross_rope_cos, cross_rope_sin, cross_attn_cache, self_attn_cache):
+    # def __call__(self, x, self_attn_mask, cross_attn_mask, self_rope_cos, self_rope_sin, cross_rope_cos, cross_rope_sin, cross_attn_cache):
         residual = x
         x_norm = self.pre_sa_norm(x)
         sa_out = self.self_attention(x=x_norm, rope_cos=self_rope_cos, rope_sin=self_rope_sin, attn_mask=self_attn_mask, kv_cache=self_attn_cache)
+        # sa_out = self.self_attention(x=x_norm, rope_cos=self_rope_cos, rope_sin=self_rope_sin, attn_mask=self_attn_mask)
         x = residual + sa_out
         residual = x
         x_norm = self.pre_ca_norm(x)
@@ -413,9 +423,11 @@ class Decoder(nnx.Module):
     
     @nnx.jit
     def __call__(self, cross_attn_mask, cross_kv_caches, tgt_ids_Bx1xC, self_rope_cos, self_rope_sin, cross_rope_cos, cross_rope_sin, self_attn_mask, self_attn_caches):
+    # def __call__(self, cross_attn_mask, cross_kv_caches, tgt_ids_Bx1xC, self_rope_cos, self_rope_sin, cross_rope_cos, cross_rope_sin, self_attn_mask, self_attn_caches=None):
         x = sum(emb(tgt_ids_Bx1xC[..., i]) for i, emb in enumerate(self.embeddings))
         for i, layer in enumerate(self.layers):
             x = layer(x, self_attn_mask=self_attn_mask, cross_attn_mask=cross_attn_mask, self_rope_cos=self_rope_cos, self_rope_sin=self_rope_sin, cross_rope_cos=cross_rope_cos, cross_rope_sin=cross_rope_sin, cross_attn_cache=cross_kv_caches[i], self_attn_cache=self_attn_caches[i])
+            # x = layer(x, self_attn_mask=self_attn_mask, cross_attn_mask=cross_attn_mask, self_rope_cos=self_rope_cos, self_rope_sin=self_rope_sin, cross_rope_cos=cross_rope_cos, cross_rope_sin=cross_rope_sin, cross_attn_cache=cross_kv_caches[i])
         x = self.norm(x)
         logits_Bx1xCxV = self.logits_dense(x)
         return logits_Bx1xCxV
@@ -451,7 +463,7 @@ class Carry(nnx.Module):
         self.caches=caches
         self.penalty=nnx.Variable(jnp.array(penalty, dtype=jnp.float16))
 
-def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, temperature=0.7, top_p=0.95, use_cfg_filter=True, cfg_filter_top_k=35, seed=0, scan_batch_size=500, use_scan=False, use_jit=False):
+def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, temperature=0.7, top_p=0.95, use_cfg_filter=True, cfg_filter_top_k=35, seed=0, scan_batch_size=500, use_scan=False, use_lax_scan=False, use_jit=False):
     tic = time.perf_counter()
     config = model.config
     key = jax.random.PRNGKey(seed)
@@ -492,30 +504,43 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
     prompt_len_inc_bos = prefill_len = tok.shape[1]
     prefill_tgt_padding_mask = jnp.any(tok != audio_pad_value, axis=2)
     sow_len = max_tokens+260
+    # sowlen = config.sowlen
     self_attn_caches = [BufCache(config.dtype, 4, sow_len, 128) for _ in range(config.model.decoder.n_layer)]
     prefill_self_attn_mask = create_causal_mask(prefill_tgt_padding_mask, prefill_tgt_padding_mask, sow_len).astype(config.dtype)
+    # prefill_self_attn_mask = create_causal_mask(prefill_tgt_padding_mask, prefill_tgt_padding_mask, config.sowlen).astype(config.dtype)
     prefill_cross_attn_mask = create_attention_mask(prefill_tgt_padding_mask, src_padding_mask_BxS).astype(config.dtype)
     prefill_tgt_pos = jnp.broadcast_to(jnp.arange(prefill_len, dtype=jnp.int32)[None, :], (2, prefill_len))
     prefill_self_cos, prefill_self_sin = dec_self_roper(prefill_tgt_pos)
     prefill_cross_cos, prefill_cross_sin = dec_cross_roper(prefill_tgt_pos)
     model.decoder(prefill_cross_attn_mask, cross_kv_caches, tok, prefill_self_cos, prefill_self_sin, prefill_cross_cos, prefill_cross_sin, prefill_self_attn_mask, self_attn_caches)
+    # model.decoder(prefill_cross_attn_mask, cross_kv_caches, tok, prefill_self_cos, prefill_self_sin, prefill_cross_cos, prefill_cross_sin, prefill_self_attn_mask)
     current_step = prompt_len_inc_bos - 1
-    tgt_padding_mask = jnp.ones((2, 1), dtype=bool)
+    tgt_padding_mask = jnp.ones((2, 1), dtype=jnp.bool)
     decoder_cross_attn_mask = create_attention_mask(tgt_padding_mask, src_padding_mask_BxS).astype(config.dtype)
     eos_detected_channel_0 = False
     eos_countdown = -1
     extra_steps_after_eos = 30
     # _sample = functools.partial(sample_next_token, temperature, top_p, cfg_filter_top_k) if temperature > 0.01 else lambda x,_:jnp.argmax(x, axis=-1)
+    _sample = nnx.cached_partial(sample_next_token, temperature, top_p, cfg_filter_top_k) if temperature > 0.01 else lambda x,_:jnp.argmax(x, axis=-1)
     V = config.model.tgt_vocab_size
     # carry = Carry(tok[:, :1, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
     # carry = Carry(tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
     # c0, carry_1 = nnx.split(carry)
     # carry_1 = (tok[:, :1, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
-    carry_1 = (tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=config.dtype))
+    carry_1 = (tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, 0.0, -1)
+    # carry_1 = (tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=config.dtype))
+    # carry_1 = (tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), model.decoder, jnp.array(0.0, dtype=config.dtype))
+    # d0, d1, d2 = nnx.split(model.decoder, nnx.Intermediate, ...)
+    # d0, d1 = nnx.split(model.decoder)
+    # carry_1 = (tok[:, -1:, :], current_step, d1, 1.0, False)
     def decode_fn(c1, key):
         # _carry = nnx.merge(c0, c1)
         # tok, idx, caches, penalty = _carry()
-        tok, idx, caches, penalty = c1
+        tok, idx, caches, penalty, eos_countdown = c1
+        # tok, idx, decoder, penalty = c1
+        # tok, idx, d1, penalty, _ = c1
+        # decoder = nnx.merge(d0,d1,d2)
+        # decoder = nnx.merge(d0,d1)
         step = idx + 1
         g_step = idx-current_step
         # pos = jnp.full((2, 1), g_step, dtype=jnp.int32)
@@ -523,27 +548,50 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
         self_cos, self_sin = dec_self_roper(pos)
         cross_cos, cross_sin = dec_cross_roper(pos)
         buf_mask = jnp.arange(sow_len) >= (sow_len - step)
-        logits_B1CxV = model.decoder(decoder_cross_attn_mask, cross_kv_caches, tok, self_cos, self_sin, cross_cos, cross_sin, jnp.where(buf_mask, 0, -1e9).astype(config.dtype), caches)
+        # buf_mask = jnp.arange(sowlen) >= (sowlen - step)
+        logits_B1CxV = model.decoder(decoder_cross_attn_mask, cross_kv_caches, tok, self_cos, self_sin, cross_cos, cross_sin, jnp.where(buf_mask, 0, -1e4).astype(config.dtype), caches)
+        # logits_B1CxV = decoder(decoder_cross_attn_mask, cross_kv_caches, tok, self_cos, self_sin, cross_cos, cross_sin, jnp.where(buf_mask, 0, -1e4).astype(config.dtype))
+        # logits_B1CxV, (_, d1) = nnx.call((d0, d1))(decoder_cross_attn_mask, cross_kv_caches, tok, self_cos, self_sin, cross_cos, cross_sin, jnp.where(buf_mask, 0, -1e4).astype(config.dtype))
         logits_last = logits_B1CxV[:, -1, :, :]
         uncond, cond = logits_last[0], logits_last[1]
         cfg_logits = cond + cfg_scale * (cond - uncond)
         logits_CV = cfg_logits[:,:1025]
-        # pred_C = sample_next_token(temperature, top_p, cfg_filter_top_k, logits_CV/(1.0+penalty), key) # overflow
-        pred_C = sample_next_token(temperature+penalty, top_p, cfg_filter_top_k, logits_CV, key)
+        # pred_C = sample_next_token(temperature, top_p, cfg_filter_top_k, logits_CV*penalty, key) # overflow
+        pred_C = _sample(logits_CV*penalty, key)
         # delay_mask = g_step >= delay_tensor
         delay_mask = idx >= delay_tensor
         pred_C = jnp.where(delay_mask, pred_C, audio_bos_value)
+        def branch_countdown(ops):
+            eos_cd, pC = ops
+            step_after_eos = max_delay_pattern - eos_cd
+            eos_ch = (step_after_eos == delay_tensor)
+            pad_ch = (step_after_eos >  delay_tensor)
+            pC1 = jnp.where(eos_ch, audio_eos_value, pC)
+            pC2 = jnp.where(pad_ch, audio_pad_value, pC1)
+            return eos_cd-1, pC2
+        def branch_normal(ops):
+            eos_cd, pC = ops
+            new_eos = jax.lax.select((eos_cd==-1)&(pC[0] == audio_eos_value), extra_steps_after_eos, eos_cd)
+            return new_eos, pC
+        eos_countdown, pred_C = jax.lax.cond(eos_countdown > 0, branch_countdown, branch_normal, (eos_countdown, pred_C))
         next_tok = jnp.broadcast_to(pred_C[None, None, :], (2, 1, num_channels))
-        rep_penalty = jnp.all(tok == next_tok).astype(config.dtype)
+        rep_penalty = (1.0/(1.0+jnp.all(tok == next_tok)))
         # _carry.set(next_tok, step, caches, rep_penalty)
         # _, _c1 = nnx.split(_carry)
         # return _c1, pred_C
-        return (next_tok, step, caches, rep_penalty), pred_C
+        return (next_tok, step, caches, rep_penalty, eos_countdown), pred_C
+        # return (next_tok, step, decoder, rep_penalty), pred_C
+        # _, d1 = nnx.split(decoder)
+        # _, d1, _ = nnx.split(decoder, nnx.Intermediate, ...)
+        # eos_chan0 = pred_C[0] == audio_eos_value
+        # return (next_tok, step, d1, rep_penalty, eos_chan0), pred_C
     # _decode_fn = functools.partial(decode_fn, model, carry_0)
     # _decode_fn = nnx.cached_partial(decode_fn, model, carry_0)
     result = []
     if use_scan:
         scan_fn = nnx.scan(decode_fn, in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))
+    # elif use_lax_scan:
+    #     scan_fn = functools.partial(jax.lax.scan, decode_fn)
     else:
         if use_jit:
             _decode_fn = nnx.jit(decode_fn)
@@ -554,7 +602,8 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
             for key in keys:
                 carry, output = _decode_fn(carry, key)
                 outputs.append(output)
-                if output[0] == audio_eos_value:
+                # if output[0] == audio_eos_value:
+                if carry[-1] == audio_eos_value:
                     break
             stacked_outputs = jnp.stack(outputs, axis=0) if outputs else jnp.array([])
             return carry, stacked_outputs
@@ -566,8 +615,11 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
         current_batch_size = min(scan_batch_size, remaining)
         keys = jax.random.split(key, current_batch_size + 1)
         carry_1, outputs = scan_fn(carry_1, keys[:-1])
-        eos_indices = jnp.where(outputs[:, 0] == audio_eos_value)[0]
-        if eos_indices.size > 0:
+        # carry_1, outputs = jax.lax.scan(decode_fn, carry_1, keys[:-1])
+        # eos_indices = jnp.where(outputs[:, 0] == audio_eos_value)[0]
+        # if eos_indices.size > 0:
+        if carry_1[-1] == 0:
+            eos_indices = jnp.where(outputs[:, 0] == audio_eos_value)[0]
             result.append(outputs[:eos_indices[0]+30])
             break
         else:
@@ -610,13 +662,15 @@ def main():
                         help='Top-k for CFG filtering')
     parser.add_argument('--scan-batch-size', type=int, default=100,
                         help='Bigger the faster but beware the crash')
+    parser.add_argument('--use-lax-scan', action='store_true', dest='use_lax_scan',
+                        help='Enable jax.lax.scan (Dont try on mac; jax-metal is broken)')
     parser.add_argument('--use-scan', action='store_true', dest='use_scan',
                         help='Enable flax.nnx.scan (Dont try on mac; jax-metal is broken)')
     parser.add_argument('--use-jit', action='store_true', dest='use_jit',
                         help='Jit decode_fn when using plain loop for token generation (noop if --use-scan)')
-    parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16'], default=None,
-                        help='Precision to use: float32, float16, or bfloat16. '
-                             'Default is None — auto-selects between bfloat16 and float16 based on hardware support.')
+    parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16'], default='bfloat16', # f16 sucks
+                        help='Precision to use: float32, float16, bfloat16, or None '
+                             'dtype=None auto-selects between bfloat16 and float16 based on hardware support.')
     args = parser.parse_args()
     print(f'{args.audio=}')
     audio_prompt = jnp.array(audio.get_audio_prompt(args.audio), dtype=jnp.int32) if args.audio is not None else None
@@ -636,6 +690,7 @@ def main():
         seed=args.seed,
         scan_batch_size=args.scan_batch_size,
         use_scan=args.use_scan,
+        use_lax_scan=args.use_lax_scan,
         use_jit=args.use_jit,
     )
     del model
