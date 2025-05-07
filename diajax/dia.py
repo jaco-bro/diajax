@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from huggingface_hub import hf_hub_download
-from safetensors.numpy import load_file
+from safetensors.flax import load_file
 from . import audio
 # import audio # DEBUG
 
@@ -31,6 +31,7 @@ def bf16vf16(size=1024, perf_threshold= 1.5, runs=5):
         hlo_text = ir.as_hlo_text()
     else:
         hlo_text = str(ir)
+    print(hlo_text)
     hlo_pattern = re.compile(r"=\s*bf16\[\d+,\d+\](?:\{[^\}]+\})?\s+dot\(")
     hlo_ok = bool(hlo_pattern.search(hlo_text))
     @jax.jit
@@ -39,10 +40,10 @@ def bf16vf16(size=1024, perf_threshold= 1.5, runs=5):
     def avg_time(x):
         matmul(x).block_until_ready()
         total = 0.0
+        tic = time.perf_counter()
         for _ in range(runs):
-            t0 = time.time()
-            matmul(x).block_until_ready()
-            total += (time.time() - t0)
+            out = matmul(x).block_until_ready()
+        total = time.perf_counter() - tic
         return total / runs
     x_f32  = jnp.ones((size, size), dtype=jnp.float32)
     x_f16  = jnp.ones((size, size), dtype=jnp.float16)
@@ -118,12 +119,12 @@ class DiaConfig(BaseModel):
     model: ModelConfig
     training: TrainingConfig
     data: DataConfig
-    DT: Optional[Literal["float32", "float16", "bfloat16"]] = Field(default=None)
+    dtype_str: Optional[Literal["float32", "float16", "bfloat16"]] = Field(default=None)
     sowlen: int = Field(default=2048)
 
     @property
     def dtype(self):
-        return dtype_lookup[self.DT]
+        return dtype_lookup[self.dtype_str]
 
     @classmethod
     def load(cls, path: str):
@@ -183,23 +184,27 @@ def save(codebook, filename='output.mp3', sr=44100):
     output = audio.get_audio_values(codebook)
     sf.write(filename, output, sr)
 
-def load(model_name='jaco-bro/Dia-1.6B', dtype=None):
+def load(model_name='jaco-bro/Dia-1.6B', dtype_str=None):
     config_path = hf_hub_download(repo_id=model_name, filename="config.json")
     config = DiaConfig.load(config_path)
-    config.DT = get_dtype(dtype)
-    model_name = model_name+'-'+config.DT if 'float16' in config.DT else model_name
+    config.dtype_str = get_dtype(dtype_str)
+    dtype = config.dtype
+    model_name = model_name+'-'+config.dtype_str if 'float16' in config.dtype_str else model_name
+    print(f"Loading model from {model_name}...")
     checkpoint_path = hf_hub_download(repo_id=model_name, filename="model.safetensors")
     # checkpoint_path = "../model.safetensors"
     graphdef, state = nnx.split(nnx.eval_shape(lambda: DiaModel(config, rngs=nnx.Rngs(0))))
     state_dict = dict(state.flat_state())
-    for path, val in ((k.replace('weight', 'embedding') if 'embeddings' in k else k.replace("norm.weight", "norm.scale").replace("proj.weight", "proj.kernel").replace("wi_fused.weight", "wi_fused.kernel").replace("wo.weight", "wo.kernel").replace("embedding.weight", "embedding.embedding").replace('logits_dense.weight', 'logits_dense.kernel'), nnx.Param(jnp.array(v))) for k, v in load_file(checkpoint_path).items()):
-        state_dict[tuple(int(part) if part.isdigit() else part for part in path.split('.'))].value = jnp.array(val, dtype=config.dtype)
+    for path, val in ((k.replace('weight', 'embedding') if 'embeddings' in k else k.replace("norm.weight", "norm.scale").replace("proj.weight", "proj.kernel").replace("wi_fused.weight", "wi_fused.kernel").replace("wo.weight", "wo.kernel").replace("embedding.weight", "embedding.embedding").replace('logits_dense.weight', 'logits_dense.kernel'), jnp.array(v, dtype=dtype)) for k, v in load_file(checkpoint_path).items()):
+        state_dict[tuple(int(part) if part.isdigit() else part for part in path.split('.'))].value = val
     model = nnx.merge(graphdef, nnx.State.from_flat_path(state_dict))
-    model.set_attributes(dtype=config.dtype, param_dtype=config.dtype)
+    model.set_attributes(dtype=dtype, param_dtype=dtype)
     return model
 
 @nnx.jit(static_argnums=(0,1,2))
 def sample_next_token(temperature, top_p, cfg_filter_top_k, logits, rng_key):
+    if temperature < 0.01:
+        return jnp.argmax(logits, axis=-1)
     logits = logits/temperature
     sorted_indices = jnp.argsort(-logits, axis=-1)
     sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
@@ -521,7 +526,7 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
     eos_countdown = -1
     extra_steps_after_eos = 30
     # _sample = functools.partial(sample_next_token, temperature, top_p, cfg_filter_top_k) if temperature > 0.01 else lambda x,_:jnp.argmax(x, axis=-1)
-    _sample = nnx.cached_partial(sample_next_token, temperature, top_p, cfg_filter_top_k) if temperature > 0.01 else lambda x,_:jnp.argmax(x, axis=-1)
+    _sample = nnx.cached_partial(sample_next_token, temperature, top_p, cfg_filter_top_k) # if temperature > 0.01 else lambda x,_:jnp.argmax(x, axis=-1)
     V = config.model.tgt_vocab_size
     # carry = Carry(tok[:, :1, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
     # carry = Carry(tok[:, -1:, :], jnp.array(current_step, dtype=jnp.int32), self_attn_caches, jnp.array(0.0, dtype=jnp.bfloat16))
@@ -633,6 +638,23 @@ def generate(model, text, audio_prompt=None, max_tokens=None, cfg_scale=3.0, tem
     print(f'{benchmark_enc:.2f} seconds in starting up\n{benchmark_tps:.2f} tokens-per-second ({benchmark_step} tokens in {benchmark_time:.2f} seconds)')
     return codebook_to_audio(result, delay_pattern, B=1, T=max_tokens, C=num_channels)
 
+def test(
+        text = "[S1] Dear Jacks, to generate audio from text from any machine. [S2] Any machine? (laughs) How? [S1] With flacks and an axe. (coughs)",
+        max_tokens = 200,
+        scan_batch_size = 100,
+    ):
+    bf16vf16()
+    for dtype in ['float16', 'bfloat16']:
+        model = load(dtype=dtype)
+        print(f'### {dtype} ###')
+        print('=== SCAN ===')
+        generate(model, text, max_tokens=max_tokens, scan_batch_size=scan_batch_size, use_scan=True)
+        print('=== JIT ===')
+        generate(model, text, max_tokens=max_tokens, scan_batch_size=scan_batch_size, use_scan=False, use_jit=True)
+        print('=== NONE ===')
+        generate(model, text, max_tokens=max_tokens, scan_batch_size=scan_batch_size, use_scan=False, use_jit=False)
+        del model
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Dia-JAX: Generate dialogue audio from text')
@@ -668,14 +690,13 @@ def main():
                         help='Enable flax.nnx.scan (Dont try on mac; jax-metal is broken)')
     parser.add_argument('--use-jit', action='store_true', dest='use_jit',
                         help='Jit decode_fn when using plain loop for token generation (noop if --use-scan)')
-    parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16'], default='bfloat16', # f16 sucks
+    parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16'], default='bfloat16',
                         help='Precision to use: float32, float16, bfloat16, or None '
                              'dtype=None auto-selects between bfloat16 and float16 based on hardware support.')
     args = parser.parse_args()
     print(f'{args.audio=}')
     audio_prompt = jnp.array(audio.get_audio_prompt(args.audio), dtype=jnp.int32) if args.audio is not None else None
-    print(f"Loading model from {args.model}...")
-    model = load(args.model, dtype=args.dtype)
+    model = load(args.model, dtype_str=args.dtype)
     print(f"Generating audio for text: {args.text}")
     output = generate(
         model, 
@@ -697,5 +718,7 @@ def main():
     print(f"Audio saved to {args.output}")
     save(output, args.output)
 
+
 if __name__ == "__main__":
     main()
+    # test()
